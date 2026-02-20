@@ -188,11 +188,27 @@ def cg_incent(
     All other params            : see generic_conditional_gradient_incent
     """
     def lp_solver(a, b, M, **kw):
+        # Always run the inner LP on CPU numpy.
+        # mm_unbalanced's convergence loop allocates several (ns × nt)
+        # temporaries; keeping them on CPU avoids CUDA OOM when the outer
+        # FGW matrices are already using most of VRAM.
+        nx_lp = ot.backend.get_backend(a, b, M)
+        a_np = nx_lp.to_numpy(a)
+        b_np = nx_lp.to_numpy(b)
+        M_np = nx_lp.to_numpy(M)
+
         if rho1 >= balanced_fallback_threshold and rho2 >= balanced_fallback_threshold:
-            return emd(a, b, M, numItermaxEmd, log=True)
-        return ot.unbalanced.mm_unbalanced(
-            a, b, M, reg_m=(rho1, rho2), div='kl', log=True
-        )
+            Gc_np, inner_log = emd(a_np, b_np, M_np, numItermaxEmd, log=True)
+        else:
+            Gc_np, inner_log = ot.unbalanced.mm_unbalanced(
+                a_np, b_np, M_np, reg_m=(rho1, rho2), div='kl', log=True
+            )
+
+        # Convert result back to the same backend and device as the inputs.
+        Gc = nx_lp.from_numpy(Gc_np)
+        if hasattr(a, 'device') and str(a.device) != 'cpu':
+            Gc = Gc.to(a.device)
+        return Gc, inner_log
 
     return generic_conditional_gradient_incent(
         a, b, M1, M2, f, df, reg, None,
