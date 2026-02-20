@@ -177,56 +177,56 @@ def pairwise_align(
         if not len(s):
             raise ValueError(f"Found empty AnnData: {s}")
 
-    # ── device / backend ─────────────────────────────────────────────────
+    # ── device manager (GPU used only for JSD preprocessing) ─────────────
+    # The FGW solve keeps ALL matrices as CPU numpy to avoid:
+    #   1. GPU OOM  — FGW matmuls create many (ns×nt) temporaries on VRAM
+    #   2. RAM doubling — dm.to() would copy each matrix into both RAM and VRAM
     dm = DeviceManager(use_gpu=config.use_gpu)
-    nx_backend = ot.backend.TorchBackend() if dm.use_gpu else ot.backend.NumpyBackend()
-    logger.info("Backend: %s  |  Device: %s", type(nx_backend).__name__, dm.device)
+    logger.info("Preprocessing device: %s  |  FGW solve: CPU", dm.device)
 
-    # ── spatial distance matrices ─────────────────────────────────────────
-    coordsA = dm.to(sliceA.obsm['spatial'].copy(), dtype=torch.float32)
-    coordsB = dm.to(sliceB.obsm['spatial'].copy(), dtype=torch.float32)
-    D_A = dm.ot_dist(coordsA, coordsA)
-    D_B = dm.ot_dist(coordsB, coordsB)
+    # ── spatial distance matrices (CPU float32) ───────────────────────────
+    coordsA = sliceA.obsm['spatial'].astype(np.float32)
+    coordsB = sliceB.obsm['spatial'].astype(np.float32)
+    D_A = ot.dist(coordsA, coordsA, metric='euclidean').astype(np.float32)
+    D_B = ot.dist(coordsB, coordsB, metric='euclidean').astype(np.float32)
 
     if config.norm:
-        D_A = D_A / D_A[D_A > 0].min()
-        D_B = D_B / D_B[D_B > 0].min()
+        D_A /= D_A[D_A > 0].min()
+        D_B /= D_B[D_B > 0].min()
 
-    # ── M1: gene-expression cosine distance ──────────────────────────────
+    # ── M1: gene-expression cosine distance (CPU float32) ─────────────────
     cosine_arr = cosine_distance(
         sliceA, sliceB, sliceA_name, sliceB_name, filePath,
         use_rep=config.use_rep, use_gpu=config.use_gpu,
         beta=config.beta, overwrite=config.overwrite,
-    ).astype(np.float32)   # float32 halves RAM vs float64
-    M1 = dm.to(cosine_arr)
+    ).astype(np.float32)
+    M1 = cosine_arr  # stays on CPU — no dm.to()
 
     # ── neighbourhood distributions ───────────────────────────────────────
     ndA = _load_or_compute_neighborhood(sliceA, sliceA_name, filePath, config)
     ndB = _load_or_compute_neighborhood(sliceB, sliceB_name, filePath, config)
 
-    # ── M2: neighbourhood dissimilarity ──────────────────────────────────
+    # ── M2: neighbourhood dissimilarity (dm.device used for chunked JSD) ──
     M2_arr = _compute_M2(ndA, ndB, sliceA_name, sliceB_name, filePath, config, dm).astype(np.float32)
-    # ndA/ndB are no longer needed — free them before putting M2 on GPU
-    del ndA, ndB
+    del ndA, ndB   # free histograms; no longer needed
     gc.collect()
-    M2 = dm.to(M2_arr)
+    if config.use_gpu:
+        torch.cuda.empty_cache()  # release any GPU scratch from JSD
+    M2 = M2_arr  # stays on CPU — no dm.to()
 
-    # ── marginals ────────────────────────────────────────────────────────
+    # ── marginals (CPU float32) ───────────────────────────────────────────
     ns, nt = sliceA.n_obs, sliceB.n_obs
-    a = dm.to(a_distribution) if a_distribution is not None else dm.to(np.ones(ns) / ns)
-    b = dm.to(b_distribution) if b_distribution is not None else dm.to(np.ones(nt) / nt)
+    a = a_distribution.astype(np.float32) if a_distribution is not None else np.ones(ns, dtype=np.float32) / ns
+    b = b_distribution.astype(np.float32) if b_distribution is not None else np.ones(nt, dtype=np.float32) / nt
 
-    # ── initial transport plan ────────────────────────────────────────────
+    # ── initial transport plan (CPU float32) ─────────────────────────────
     if G_init is not None:
-        G0 = dm.to(G_init.astype(np.float32))
+        G0 = G_init.astype(np.float32)
     elif config.cell_type_init:
         logger.info("Building cell-type aware G₀ (weight=%.1f)", config.cell_type_init_weight)
-        a_np = dm.to_numpy(a)
-        b_np = dm.to_numpy(b)
-        G0_np = cell_type_aware_init(
-            sliceA, sliceB, a_np, b_np, weight=config.cell_type_init_weight
-        )
-        G0 = dm.to(G0_np.astype(np.float32))
+        G0 = cell_type_aware_init(
+            sliceA, sliceB, a, b, weight=config.cell_type_init_weight
+        ).astype(np.float32)
     else:
         G0 = None   # fgw will fall back to outer(a, b)
 
@@ -239,7 +239,8 @@ def pairwise_align(
                 init_obj_gene, init_obj_neighbor)
 
     # ── solve FGW ────────────────────────────────────────────────────────
-    pi_raw, log_dict = fused_gromov_wasserstein_incent(
+    # All inputs are numpy float32 → POT uses NumpyBackend automatically → no GPU
+    pi, log_dict = fused_gromov_wasserstein_incent(
         M1, M2, D_A, D_B, a, b,
         gamma=config.gamma,
         G_init=G0,
@@ -249,16 +250,13 @@ def pairwise_align(
         numItermax=config.numItermax,
         tol_rel=config.tol_rel,
         tol_abs=config.tol_abs,
-        use_gpu=config.use_gpu,
+        use_gpu=False,   # FGW always on CPU; GPU was already freed after JSD
         rho1=config.rho1,
         rho2=config.rho2,
         balanced_fallback_threshold=config.balanced_fallback_threshold,
     )
-
-    pi = dm.to_numpy(pi_raw)
-    del pi_raw
-    if config.use_gpu:
-        torch.cuda.empty_cache()
+    # pi is already a numpy array (NumpyBackend output)
+    pi = np.asarray(pi, dtype=np.float32)
 
     # ── save transport plan ───────────────────────────────────────────────
     np.save(os.path.join(filePath, f"pi_matrix_{sliceA_name}_{sliceB_name}.npy"), pi)
@@ -268,10 +266,8 @@ def pairwise_align(
     final_obj_neighbor = float(np.sum(M2_arr * pi, dtype=np.float64))
 
     # ── marginal violation (how far from balanced) ───────────────────────
-    a_np = dm.to_numpy(a)
-    b_np = dm.to_numpy(b)
-    src_viol = float(np.sum(np.abs(pi.sum(axis=1) - a_np)))
-    tgt_viol = float(np.sum(np.abs(pi.sum(axis=0) - b_np)))
+    src_viol = float(np.sum(np.abs(pi.sum(axis=1) - a)))
+    tgt_viol = float(np.sum(np.abs(pi.sum(axis=0) - b)))
 
     elapsed = time.time() - start
     logger.info("Final objective   — gene: %.6g  |  neighbour: %.6g", final_obj_gene, final_obj_neighbor)
