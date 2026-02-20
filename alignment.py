@@ -15,6 +15,7 @@ Design decisions
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -196,7 +197,7 @@ def pairwise_align(
         sliceA, sliceB, sliceA_name, sliceB_name, filePath,
         use_rep=config.use_rep, use_gpu=config.use_gpu,
         beta=config.beta, overwrite=config.overwrite,
-    )
+    ).astype(np.float32)   # float32 halves RAM vs float64
     M1 = dm.to(cosine_arr)
 
     # ── neighbourhood distributions ───────────────────────────────────────
@@ -204,7 +205,10 @@ def pairwise_align(
     ndB = _load_or_compute_neighborhood(sliceB, sliceB_name, filePath, config)
 
     # ── M2: neighbourhood dissimilarity ──────────────────────────────────
-    M2_arr = _compute_M2(ndA, ndB, sliceA_name, sliceB_name, filePath, config, dm)
+    M2_arr = _compute_M2(ndA, ndB, sliceA_name, sliceB_name, filePath, config, dm).astype(np.float32)
+    # ndA/ndB are no longer needed — free them before putting M2 on GPU
+    del ndA, ndB
+    gc.collect()
     M2 = dm.to(M2_arr)
 
     # ── marginals ────────────────────────────────────────────────────────
@@ -227,9 +231,10 @@ def pairwise_align(
         G0 = None   # fgw will fall back to outer(a, b)
 
     # ── initial-objective diagnostic ─────────────────────────────────────
-    G_unif = np.ones((ns, nt), dtype=np.float64) / (ns * nt)
-    init_obj_gene = float(np.sum(cosine_arr * G_unif))
-    init_obj_neighbor = float(np.sum(M2_arr * G_unif))
+    # Use mean() instead of allocating a full (ns, nt) G_unif matrix:
+    # sum(M * G_unif) = sum(M) / (ns*nt) = mean(M)
+    init_obj_gene = float(np.mean(cosine_arr))
+    init_obj_neighbor = float(np.mean(M2_arr))
     logger.info("Initial objective — gene: %.6g  |  neighbour: %.6g",
                 init_obj_gene, init_obj_neighbor)
 
@@ -251,13 +256,16 @@ def pairwise_align(
     )
 
     pi = dm.to_numpy(pi_raw)
+    del pi_raw
+    if config.use_gpu:
+        torch.cuda.empty_cache()
 
     # ── save transport plan ───────────────────────────────────────────────
     np.save(os.path.join(filePath, f"pi_matrix_{sliceA_name}_{sliceB_name}.npy"), pi)
 
     # ── final objectives ─────────────────────────────────────────────────
-    final_obj_gene = float(np.sum(cosine_arr * pi))
-    final_obj_neighbor = float(np.sum(M2_arr * pi))
+    final_obj_gene = float(np.sum(cosine_arr * pi, dtype=np.float64))
+    final_obj_neighbor = float(np.sum(M2_arr * pi, dtype=np.float64))
 
     # ── marginal violation (how far from balanced) ───────────────────────
     a_np = dm.to_numpy(a)

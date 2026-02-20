@@ -120,12 +120,12 @@ def pairwise_msd(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """
     Pairwise mean squared distance between rows of A (m,d) and B (n,d).
 
-    Returns (m, n) float64 numpy array.
+    Returns (m, n) float32 numpy array.
     """
-    A = np.asarray(A)
-    B = np.asarray(B)
+    A = np.asarray(A, dtype=np.float32)
+    B = np.asarray(B, dtype=np.float32)
     diff = A[:, np.newaxis, :] - B[np.newaxis, :, :]  # (m, n, d)
-    return np.mean(diff ** 2, axis=2)                   # (m, n)
+    return np.mean(diff ** 2, axis=2).astype(np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ def cosine_distance(
         print("CUDA is not available — computing on CPU.")
         s_A_np, s_B_np = s_A, s_B
 
-    cosine_dist_gene_expr = cosine_distances(s_A_np, s_B_np)
+    cosine_dist_gene_expr = cosine_distances(s_A_np, s_B_np).astype(np.float32)
 
     print("Saving cosine distance of gene expression")
     np.save(fileName, cosine_dist_gene_expr)

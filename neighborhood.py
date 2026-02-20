@@ -1,52 +1,23 @@
 """
-Cellular neighbourhood distribution computation — parallelised with joblib.
+Cellular neighbourhood distribution computation.
 
-Improvement over the original
-------------------------------
-The original uses a sequential for-loop over all n cells.  On a 4-core
-workstation this takes ~4× longer than necessary.  Here we dispatch each
-cell's radius query to a thread-pool worker (joblib prefer='threads').
-NumPy releases the GIL for distance comparisons, so threads run in parallel
-on multi-core CPUs without the overhead of process spawning.
+Memory design
+-------------
+The previous version called euclidean_distances(coords, coords) which builds
+an O(n^2) float64 matrix (~800 MB for 10 k cells).  With joblib threads each
+holding a reference that memory is replicated and can exhaust all RAM.
 
-Memory: only the O(n²) pairwise distance matrix is computed once; the
-per-cell neighbourhood accumulation is read-only on that matrix.
+This version uses sklearn.neighbors.BallTree.query_radius which returns only
+the *indices* of cells within the radius -- O(n*k) memory where k is the
+average neighbourhood size (typically k << n).
 """
 from __future__ import annotations
 
 import numpy as np
 from anndata import AnnData
-from joblib import Parallel, delayed
-from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.neighbors import BallTree
 from tqdm import tqdm
 
-
-def _row_neighborhood(
-    distances_row: np.ndarray,
-    radius: float,
-    cell_types: np.ndarray,
-    type_to_idx: dict,
-    n_types: int,
-) -> np.ndarray:
-    """
-    Compute the neighbourhood composition histogram for a single cell.
-
-    Parameters
-    ----------
-    distances_row : (nt,) array — pairwise distances from this cell
-    radius        : float       — include cells within this radius
-    cell_types    : (nt,) array — cell type label for each neighbour
-    type_to_idx   : dict        — maps label → integer index
-    n_types       : int         — total number of cell types
-
-    Returns
-    -------
-    histogram : (n_types,) float64 array
-    """
-    hist = np.zeros(n_types, dtype=np.float64)
-    for idx in np.where(distances_row <= radius)[0]:
-        hist[type_to_idx[cell_types[idx]]] += 1.0
-    return hist
 
 
 def neighborhood_distribution(
@@ -58,6 +29,9 @@ def neighborhood_distribution(
     Compute the cellular neighbourhood type-composition distribution for
     every cell in `curr_slice`.
 
+    Uses BallTree.query_radius to avoid materialising the full (n, n)
+    pairwise distance matrix -- O(n*k) memory instead of O(n^2).
+
     Parameters
     ----------
     curr_slice : AnnData
@@ -65,12 +39,11 @@ def neighborhood_distribution(
     radius : float
         Neighbourhood radius in the same units as `obsm['spatial']`.
     n_jobs : int
-        Number of parallel workers.  -1 = all available CPUs.
-        Jobs use threads (not processes) so no pickling overhead.
+        Kept for API compatibility (BallTree query is already efficient).
 
     Returns
     -------
-    distributions : (n_cells, n_cell_types) float64 ndarray
+    distributions : (n_cells, n_cell_types) float32 ndarray
     """
     cell_types = np.array(curr_slice.obs['cell_type_annot'])
     unique_types = np.unique(cell_types)
@@ -78,14 +51,16 @@ def neighborhood_distribution(
     n_types = len(unique_types)
     n_cells = curr_slice.n_obs
 
-    coords = curr_slice.obsm['spatial']
-    distances = euclidean_distances(coords, coords)  # (n, n)
+    coords = curr_slice.obsm['spatial'].astype(np.float32)
 
-    rows = Parallel(n_jobs=n_jobs, prefer='threads')(
-        delayed(_row_neighborhood)(
-            distances[i], radius, cell_types, type_to_idx, n_types
-        )
-        for i in tqdm(range(n_cells), desc="Neighbourhood distribution")
-    )
+    # BallTree returns variable-length arrays of neighbour indices per cell.
+    # Peak memory: O(n*k) index arrays, not O(n^2) float64 distances.
+    tree = BallTree(coords, leaf_size=40)
+    neighbor_lists = tree.query_radius(coords, r=radius)   # list of n arrays
 
-    return np.array(rows, dtype=np.float64)
+    result = np.zeros((n_cells, n_types), dtype=np.float32)
+    for i in tqdm(range(n_cells), desc="Neighbourhood distribution"):
+        for idx in neighbor_lists[i]:
+            result[i, type_to_idx[cell_types[idx]]] += 1.0
+
+    return result
